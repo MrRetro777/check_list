@@ -1,0 +1,107 @@
+Безопасность
+
+    Фильтрация трафика — правила описывают, какие соединения и по каким критериям следует разрешить, а какие — запретить. Например:
+        Разрешение установленных и связанных соединений — первое правило в цепочке, после него анализируются новые подключения. 
+        Запрет некорректных соединений — правило отбрасывает соединения, которые роутер посчитает некорректными 
+        Проброс портов (Port Forwarding) — правило указывает, какому устройству перенаправить запрос извне.
+
+Настройка Firewall
+/ip firewall filter
+# Блокировка невалидных соединений
+add chain=input connection-state=invalid action=drop comment="Drop Invalid"
+add chain=forward connection-state=invalid action=drop
+
+# Защита от сканирования портов
+add chain=input protocol=tcp psd=21,3s,3,1 action=drop comment="Block Port Scanning"
+
+# Защита от SYN-flood атак
+add chain=input protocol=tcp tcp-flags=syn connection-limit=3,32 action=add-src-to-address-list address-list=syn_flood timeout=1m
+add chain=input src-address-list=syn_flood action=drop
+
+# Ограничение доступа к сервисам MikroTik
+add chain=input protocol=tcp dst-port=22,8291,8728,8729 src-address=192.168.0.0/16 action=accept comment="Allow Admin from LAN"
+add chain=input protocol=tcp dst-port=22,8291,8728,8729 action=drop comment="Block Admin from WAN"
+
+Настройка сервисов
+/ip service
+set telnet disabled=yes
+set ftp disabled=yes
+set www disabled=yes
+set www-ssl disabled=no port=8443
+set ssh port=2222
+set api disabled=yes
+set api-ssl disabled=yes
+set winbox port=8291
+
+Настройка VPN для безопасного доступа
+/ip ipsec proposal
+add name=enterprise-proposal auth-algorithms=sha256 enc-algorithms=aes-256-cbc
+
+/ip ipsec policy
+add src-address=192.168.1.0/24 dst-address=10.0.0.0/24 proposal=enterprise-proposal
+
+SSTP VPN
+/interface sstp-server server
+set enabled=yes authentication=mschap2 default-profile=default-encryption
+
+/ppp profile
+set default-encryption use-encryption=required
+
+Сегментация сети
+Создание VLAN
+
+/interface vlan
+add name=Management vlan-id=10 interface=bridge-local
+add name=Users vlan-id=20 interface=bridge-local
+add name=Servers vlan-id=30 interface=bridge-local
+add name=Guests vlan-id=40 interface=bridge-local
+
+Firewall правила между сегментами
+/ip firewall filter
+add chain=forward src-address-list=guests dst-address-list=servers action=drop comment="Block Guests to Servers"
+add chain=forward src-address-list=users dst-address-list=management action=accept comment="Allow Users to Management"
+
+Безопасность беспроводной сети
+Настройка WPA2/WPA3
+/interface wireless security-profiles
+set [ find default=yes ] supplicant-identity=MikroTik
+add name=corporate-wpa2 mode=dynamic-keys authentication-types=wpa2-psk unicast-ciphers=aes-ccm group-ciphers=aes-ccm wpa2-pre-shared-key=StrongWirelessKey123
+
+/interface wireless
+set [ find default-name=wlan1 ] security-profile=corporate-wpa2 mode=ap-bridge ssid=Corp-Network disabled=no
+
+Включение детального логирования
+/system logging
+add action=remote topics=firewall,info target=192.168.1.100:514
+add action=disk topics=error,critical
+
+Настройка Netwatch для мониторинга
+/tool netwatch
+add host=8.8.8.8 timeout=3s interval=30s up-script="/log info \"Internet UP\"" down-script="/log warning \"Internet DOWN\""
+
+Автоматическое резервное копирование
+/system scheduler
+add name="Daily Backup" interval=1d on-event="/system backup save name=[/system identity get name]-[\\$[/system clock get date]]"
+
+/export file=config-backup
+
+MAC-фильтрация
+/interface wireless access-list
+add mac-address=AA:BB:CC:DD:EE:FF interface=wlan1 comment="Allowed Device"
+
+Ограничение скорости 
+/queue simple
+add name=guest-limit target=192.168.88.0/24 max-limit=10M/10M
+
+Проверка безопасности
+/system script
+add name=security-check source=":log info \"Security check started\";\n/ip firewall filter print;\n/ip service print;\n/user active print;"
+
+
+
+
+
+
+
+
+
