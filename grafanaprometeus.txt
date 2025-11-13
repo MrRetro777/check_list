@@ -1,0 +1,377 @@
+Развертывание Grafana и Prometheus для мониторинга БД и резервного копирования
+Архитектура решения
+Prometheus (сбор метрик) → Grafana (визуализация)
+    ↓
+Экспортеры:
+- PostgreSQL/MySQL экспортеры
+- node_exporter (системные метрики)
+- custom экспортеры для бэкапов
+
+Установка и настройка Prometheus
+Установка Prometheus
+# Создание пользователя
+sudo useradd --no-create-home --shell /bin/false prometheus
+sudo mkdir /etc/prometheus /var/lib/prometheus
+sudo chown prometheus:prometheus /etc/prometheus /var/lib/prometheus
+
+# Загрузка и установка
+cd /tmp
+wget https://github.com/prometheus/prometheus/releases/download/v2.47.0/prometheus-2.47.0.linux-amd64.tar.gz
+tar xvf prometheus-2.47.0.linux-amd64.tar.gz
+cd prometheus-2.47.0.linux-amd64
+
+sudo cp prometheus promtool /usr/local/bin/
+sudo chown prometheus:prometheus /usr/local/bin/prometheus /usr/local/bin/promtool
+
+sudo cp -r consoles console_libraries /etc/prometheus/
+sudo chown -R prometheus:prometheus /etc/prometheus/
+
+Конфигурация Prometheus
+# /etc/prometheus/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  # Мониторинг самого Prometheus
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Мониторинг серверов
+  - job_name: 'node_exporter'
+    static_configs:
+      - targets: ['localhost:9100', 'db-server:9100', 'backup-server:9100']
+    scrape_interval: 30s
+
+  # Мониторинг PostgreSQL
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['db-server:9187']
+    params:
+      collect[]:
+        - standard
+        - database
+
+  # Мониторинг MySQL
+  - job_name: 'mysql'
+    static_configs:
+      - targets: ['db-server:9104']
+
+  # Мониторинг бэкапов
+  - job_name: 'backup_monitor'
+    static_configs:
+      - targets: ['backup-server:9191']
+    scrape_interval: 1m
+
+  # Blackbox exporter для проверки доступности
+  - job_name: 'blackbox'
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+        - http://db-server:5432/health
+        - http://backup-server:8080/status
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: localhost:9115
+Service файл для Prometheus
+# /etc/systemd/system/prometheus.service
+[Unit]
+Description=Prometheus Time Series Collection and Processing Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/prometheus \
+    --config.file /etc/prometheus/prometheus.yml \
+    --storage.tsdb.path /var/lib/prometheus/ \
+    --web.console.templates=/etc/prometheus/consoles \
+    --web.console.libraries=/etc/prometheus/console_libraries \
+    --web.listen-address=0.0.0.0:9090
+
+ExecReload=/bin/kill -HUP $MAINPID
+TimeoutStopSec=20s
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+Установка экспортеров
+node_exporter для системных метрик
+# Установка
+wget https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+tar xvf node_exporter-1.6.1.linux-amd64.tar.gz
+sudo cp node_exporter-1.6.1.linux-amd64/node_exporter /usr/local/bin/
+sudo chown node_exporter:node_exporter /usr/local/bin/node_exporter
+
+# Service файл
+sudo nano /etc/systemd/system/node_exporter.service
+PostgreSQL экспортер
+# Установка
+wget https://github.com/prometheus-community/postgres_exporter/releases/download/v0.12.0/postgres_exporter-0.12.0.linux-amd64.tar.gz
+tar xvf postgres_exporter-0.12.0.linux-amd64.tar.gz
+sudo cp postgres_exporter-0.12.0.linux-amd64/postgres_exporter /usr/local/bin/
+
+# Настройка переменных окружения
+echo "DATA_SOURCE_NAME=postgresql://monitor:password@localhost:5432/postgres?sslmode=disable" > /etc/default/postgres_exporter
+MySQL экспортер
+wget https://github.com/prometheus/mysqld_exporter/releases/download/v0.15.0/mysqld_exporter-0.15.0.linux-amd64.tar.gz
+tar xvf mysqld_exporter-0.15.0.linux-amd64.tar.gz
+sudo cp mysqld_exporter-0.15.0.linux-amd64/mysqld_exporter /usr/local/bin/
+Кастомный экспортер для мониторинга бэкапов
+#!/usr/bin/env python3
+# /opt/backup_monitor/backup_exporter.py
+
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import time
+import subprocess
+import os
+import json
+from datetime import datetime
+
+class BackupMetrics:
+    def __init__(self):
+        self.metrics = {}
+    
+    def check_postgres_backup(self):
+        """Проверка бэкапов PostgreSQL"""
+        try:
+            # Проверка последнего бэкапа
+            backup_dir = "/var/backups/postgres"
+            if os.path.exists(backup_dir):
+                backups = [f for f in os.listdir(backup_dir) if f.endswith('.sql') or f.endswith('.dump')]
+                if backups:
+                    latest_backup = max(backups)
+                    backup_path = os.path.join(backup_dir, latest_backup)
+                    backup_time = os.path.getmtime(backup_path)
+                    backup_age = time.time() - backup_time
+                    
+                    self.metrics['backup_age_seconds'] = backup_age
+                    self.metrics['backup_success'] = 1 if backup_age < 86400 else 0
+                    self.metrics['backup_size_bytes'] = os.path.getsize(backup_path)
+                else:
+                    self.metrics['backup_success'] = 0
+            else:
+                self.metrics['backup_success'] = 0
+                
+        except Exception as e:
+            self.metrics['backup_success'] = 0
+            print(f"Error checking PostgreSQL backup: {e}")
+
+    def check_mysql_backup(self):
+        """Проверка бэкапов MySQL"""
+        try:
+            # Аналогичная логика для MySQL
+            pass
+        except Exception as e:
+            print(f"Error checking MySQL backup: {e}")
+
+    def check_borg_backup(self):
+        """Проверка BorgBackup"""
+        try:
+            result = subprocess.run([
+                'borg', 'list', '--last', '1', '--json'
+            ], capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                if data['archives']:
+                    latest = data['archives'][0]
+                    backup_time = datetime.fromisoformat(latest['time'].replace('Z', '+00:00')).timestamp()
+                    backup_age = time.time() - backup_time
+                    
+                    self.metrics['borg_backup_age_seconds'] = backup_age
+                    self.metrics['borg_backup_success'] = 1 if backup_age < 86400 else 0
+                else:
+                    self.metrics['borg_backup_success'] = 0
+            else:
+                self.metrics['borg_backup_success'] = 0
+                
+        except Exception as e:
+            self.metrics['borg_backup_success'] = 0
+            print(f"Error checking Borg backup: {e}")
+
+    def collect_metrics(self):
+        self.metrics.clear()
+        self.check_postgres_backup()
+        self.check_mysql_backup()
+        self.check_borg_backup()
+        return self.metrics
+
+class MetricsHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/metrics':
+            metrics = backup_metrics.collect_metrics()
+            
+            response = ""
+            for key, value in metrics.items():
+                response += f"backup_{key} {value}\n"
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(response.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+if __name__ == '__main__':
+    backup_metrics = BackupMetrics()
+    server = HTTPServer(('0.0.0.0', 9191), MetricsHandler)
+    print("Backup metrics exporter started on port 9191")
+    server.serve_forever()
+Service файл для экспортера бэкапов
+# /etc/systemd/system/backup_exporter.service
+[Unit]
+Description=Backup Metrics Exporter
+After=network.target
+
+[Service]
+Type=simple
+User=backup
+ExecStart=/usr/bin/python3 /opt/backup_monitor/backup_exporter.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+
+Установка и настройка Grafana
+# Ubuntu/Debian
+sudo apt-get install -y software-properties-common
+sudo add-apt-repository "deb https://packages.grafana.com/oss/deb stable main"
+wget -q -O - https://packages.grafana.com/gpg.key | sudo apt-key add -
+sudo apt-get update
+sudo apt-get install grafana
+
+# Или через Docker
+docker run -d -p 3000:3000 --name=grafana \
+  -v grafana-storage:/var/lib/grafana \
+  grafana/grafana
+Настройка datasource в Grafana
+# /etc/grafana/provisioning/datasources/prometheus.yml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://localhost:9090
+    isDefault: true
+    editable: true
+Дашборд для мониторинга БД (JSON)
+{
+  "dashboard": {
+    "title": "Database Monitoring",
+    "panels": [
+      {
+        "title": "Database Connections",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "pg_stat_database_numbackends{datname=\"postgres\"}",
+            "legendFormat": "Active Connections"
+          }
+        ]
+      },
+      {
+        "title": "Backup Status",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "backup_success",
+            "legendFormat": "Backup Status"
+          }
+        ],
+        "thresholds": {
+          "steps": [
+            {"color": "red", "value": 0},
+            {"color": "green", "value": 1}
+          ]
+        }
+      }
+    ]
+  }
+}
+Правила алертинга для Prometheus
+# /etc/prometheus/alert_rules.yml
+groups:
+- name: backup_alerts
+  rules:
+  - alert: BackupFailed
+    expr: backup_success == 0
+    for: 1h
+    labels:
+      severity: critical
+    annotations:
+      summary: "Backup has failed"
+      description: "Database backup has been failing for more than 1 hour"
+
+  - alert: BackupTooOld
+    expr: backup_age_seconds > 86400
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Backup is too old"
+      description: "Last successful backup is more than 24 hours old"
+
+- name: database_alerts
+  rules:
+  - alert: HighDatabaseConnections
+    expr: pg_stat_database_numbackends > 50
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High number of database connections"
+Запуск всех сервисов
+bash
+
+sudo systemctl daemon-reload
+sudo systemctl enable prometheus node_exporter postgres_exporter backup_exporter grafana-server
+sudo systemctl start prometheus node_exporter postgres_exporter backup_exporter grafana-server
+
+# Проверка статуса
+sudo systemctl status prometheus
+curl http://localhost:9090/metrics
+curl http://localhost:9191/metrics
+
+ Проверка метрик
+bash
+
+# Проверка доступности Prometheus
+curl http://localhost:9090/-/healthy
+
+# Проверка метрик бэкапов
+curl http://localhost:9191/metrics
+
+# Проверка targets в Prometheus
+curl http://localhost:9090/api/v1/targets
+
+ Дополнительные настройки
+ Настройка резервного копирования Grafana
+bash
+
+# Резервное копирование дашбордов
+sudo tar -czf grafana-backup-$(date +%Y%m%d).tar.gz /var/lib/grafana/dashboards/
+
+# Автоматическое резервное копирование через cron
+0 2 * * * tar -czf /backup/grafana/grafana-$(date +\%Y\%m\%d).tar.gz /var/lib/grafana/
+
+ Мониторинг производительности
+bash
+
+# Настройка retention политик
+--storage.tsdb.retention.time=30d
+--storage.tsdb.retention.size=100GB
